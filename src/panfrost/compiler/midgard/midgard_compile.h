@@ -29,6 +29,8 @@ uint32_t midgard_get_compiler_flags(void);
  * solution. */
 
 static const nir_shader_compiler_options midgard_nir_options = {
+   /* Vulkan device groups have one device here. */
+   .lower_device_index_to_zero = true,
    .lower_fdiv = true,
    .lower_flrp16 = true,
    .lower_flrp32 = true,

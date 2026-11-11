@@ -1007,7 +1007,10 @@ mir_schedule_condition(compiler_context *ctx,
             cond->swizzle[s][q + COMPONENT_W] = cond->swizzle[s][q];
       }
 
-      last->swizzle[condition_index][0] = COMPONENT_W;
+      /* Every entry: in a vector unit the csel reads the entry of its
+       * destination component, not entry 0. */
+      for (unsigned q = 0; q < MIR_VEC_COMPONENTS; ++q)
+         last->swizzle[condition_index][q] = COMPONENT_W;
    }
 
    /* Schedule the unit: csel is always in the latter pipeline, so a csel

@@ -1184,6 +1184,28 @@ install_registers_instr(compiler_context *ctx, struct lcra_state *l,
          ins->swizzle[3][0] = offset.offset / 4;
       }
 
+      /* Computed texture and sampler indices: .x and .y of src[0] */
+      if (ins->src[0] != ~0) {
+         struct phys_reg idx = index_to_reg(ctx, l, ins->src[0], src_shift[0]);
+         assert(!(idx.offset & 3));
+         const unsigned comp = idx.offset / 4;
+         assert(comp + 1 < 4);
+         for (unsigned k = 0; k < 2; ++k) {
+            midgard_tex_register_select sel = {
+               .full = 1,
+               .select = idx.reg & 1,
+               .component = comp + k,
+            };
+            uint8_t packed;
+            memcpy(&packed, &sel, sizeof(packed));
+            if (k == 0 && ins->texture.texture_register)
+               ins->texture.texture_handle = packed;
+            if (k == 1 && ins->texture.sampler_register)
+               ins->texture.sampler_handle = packed;
+         }
+         ins->src[0] = SSA_FIXED_REGISTER(idx.reg);
+      }
+
       break;
    }
 

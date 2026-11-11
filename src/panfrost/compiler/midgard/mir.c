@@ -314,6 +314,11 @@ mir_bytemask_of_read_components_index(const midgard_instruction *ins,
    if (ins->compact_branch && ins->branch.conditional && (i == 0))
       return 0xF;
 
+   /* A texture instruction's computed indices (emit_texop_native): .x and
+    * .y of src[0], 32-bit. */
+   if (ins->type == TAG_TEXTURE_4 && i == 0)
+      return 0xFF;
+
    /* ALU ops act componentwise so we need to pay attention to
     * their mask. Texture/ldst does not so we don't clamp source
     * readmasks based on the writemask */

@@ -447,6 +447,10 @@ midgard_postprocess_nir(nir_shader *nir, unsigned arch)
     * the 32-bit division lowering, which the 64-bit one may emit. */
    NIR_PASS(_, nir, nir_lower_int64);
 
+   /* bit_count and bitfield_reverse (midgard_nir_options): GL's state
+    * tracker runs this pass, Vulkan drivers must. */
+   NIR_PASS(_, nir, nir_lower_alu);
+
    nir_lower_idiv_options idiv_options = {
       .allow_fp16 = true,
    };
@@ -2308,6 +2312,35 @@ emit_texop_native(compiler_context *ctx, nir_tex_instr *instr,
       for (int i = 0; i < 4; ++i)
          ins.swizzle[0][i] = COMPONENT_X;
 
+   /* Computed indices: the texture's in .x and the sampler's in .y of a
+    * temporary in src[0], which a texture instruction does not otherwise
+    * use (its swizzle[0] is the output swizzle). Register allocation turns
+    * the two components into the handles' register selects
+    * (install_registers_instr). The index is the whole table index: the
+    * driver leaves texture_index and sampler_index 0 beside an offset. */
+   const int tex_off = nir_tex_instr_src_index(instr, nir_tex_src_texture_offset);
+   const int samp_off = nir_tex_instr_need_sampler(instr)
+                           ? nir_tex_instr_src_index(instr, nir_tex_src_sampler_offset)
+                           : -1;
+   if (tex_off >= 0 || samp_off >= 0) {
+      ins.src[0] = make_compiler_temp_reg(ctx);
+      ins.src_types[0] = nir_type_uint32;
+      const int offs[2] = {tex_off, samp_off};
+      for (unsigned k = 0; k < 2; ++k) {
+         if (offs[k] < 0)
+            continue;
+         unsigned index = nir_src_index(ctx, &instr->src[offs[k]].src);
+         emit_explicit_constant(ctx, index);
+         midgard_instruction mov = v_mov(index, ins.src[0]);
+         mov.mask = 1 << k;
+         for (unsigned c = 0; c < MIR_VEC_COMPONENTS; ++c)
+            mov.swizzle[1][c] = COMPONENT_X;
+         emit_mir_instruction(ctx, &mov);
+      }
+      ins.texture.texture_register = tex_off >= 0;
+      ins.texture.sampler_register = samp_off >= 0;
+   }
+
    for (unsigned i = 0; i < instr->num_srcs; ++i) {
       int index = nir_src_index(ctx, &instr->src[i].src);
       unsigned sz = nir_src_bit_size(instr->src[i].src);
@@ -2354,6 +2387,11 @@ emit_texop_native(compiler_context *ctx, nir_tex_instr *instr,
       case nir_tex_src_comparator:
       case nir_tex_src_ms_index:
          /* Nothing to do, handled in set_tex_coord() */
+         break;
+
+      case nir_tex_src_texture_offset:
+      case nir_tex_src_sampler_offset:
+         /* Handled above, in src[0]. */
          break;
 
       default: {
