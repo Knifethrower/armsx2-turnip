@@ -52,6 +52,11 @@ struct pan_compile_inputs {
    /* Varying layout in memory, if known */
    const struct pan_varying_layout *varying_layout;
 
+   /* Midgard: load reorderable buffer values again inside the deeper loops
+    * that use them, trading loads for registers (the driver's retry when a
+    * shader goes over 8 work registers and loses half its threads). */
+   bool midgard_remat_loop_loads;
+
    /* Settings to move constants into the FAU. */
    struct {
       /* Driver-reserved range at the start of the FAU */

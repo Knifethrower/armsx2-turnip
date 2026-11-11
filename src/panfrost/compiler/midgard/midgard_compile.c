@@ -489,8 +489,199 @@ midgard_lower_texture_nir(nir_shader *nir, unsigned arch)
 }
 
 
+static unsigned
+mdg_loop_depth(nir_block *block)
+{
+   unsigned d = 0;
+   for (nir_cf_node *n = block->cf_node.parent; n; n = n->parent) {
+      if (n->type == nir_cf_node_loop)
+         d++;
+   }
+   return d;
+}
+
+static bool
+mdg_is_remat_load(nir_intrinsic_instr *intr, bool no_global_writes)
+{
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_ubo:
+      return true;
+   case nir_intrinsic_load_global:
+   case nir_intrinsic_load_global_constant:
+   case nir_intrinsic_load_ssbo:
+      return no_global_writes || (nir_intrinsic_access(intr) & ACCESS_CAN_REORDER);
+   default:
+      return false;
+   }
+}
+
+/* No global or SSBO stores or atomics: nothing in the shader changes what a
+ * global load reads. */
+static bool
+mdg_no_global_writes(nir_function_impl *impl)
+{
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         switch (nir_instr_as_intrinsic(instr)->intrinsic) {
+         case nir_intrinsic_store_global:
+         case nir_intrinsic_store_ssbo:
+         case nir_intrinsic_global_atomic:
+         case nir_intrinsic_global_atomic_swap:
+         case nir_intrinsic_ssbo_atomic:
+         case nir_intrinsic_ssbo_atomic_swap:
+            return false;
+         default:
+            break;
+         }
+      }
+   }
+   return true;
+}
+
+/* A load's sources must be available at the start of the use block. */
+static bool
+mdg_srcs_dominate(nir_intrinsic_instr *intr, nir_block *block)
+{
+   for (unsigned i = 0; i < nir_intrinsic_infos[intr->intrinsic].num_srcs; i++) {
+      if (nir_def_block(intr->src[i].ssa) == block)
+         return false;
+   }
+   return true;
+}
+
+/* The value of def at b's cursor, its ALU expression rebuilt there (to a few
+ * levels) so that only the expression's roots stay live; remap holds what
+ * this block already has. */
+static bool mdg_is_remat_load(nir_intrinsic_instr *intr, bool no_global_writes);
+
+static nir_def *
+mdg_remat_expr(nir_builder *b, nir_def *def, struct hash_table *remap, unsigned depth,
+               bool no_global_writes)
+{
+   struct hash_entry *e = _mesa_hash_table_search(remap, def);
+   if (e)
+      return e->data;
+   nir_instr *instr = nir_def_instr(def);
+   if (instr->type == nir_instr_type_load_const) {
+      nir_instr *c = nir_instr_clone(b->shader, instr);
+      nir_builder_instr_insert(b, c);
+      nir_def *r = &nir_instr_as_load_const(c)->def;
+      _mesa_hash_table_insert(remap, def, r);
+      return r;
+   }
+   if (depth >= 6 || instr->block == b->cursor.block)
+      return def;
+   if (instr->type == nir_instr_type_intrinsic &&
+       mdg_is_remat_load(nir_instr_as_intrinsic(instr), no_global_writes)) {
+      nir_intrinsic_instr *ld = nir_instr_as_intrinsic(instr);
+      const unsigned ns = nir_intrinsic_infos[ld->intrinsic].num_srcs;
+      nir_def *lsrcs[4];
+      for (unsigned i = 0; i < ns; i++)
+         lsrcs[i] = mdg_remat_expr(b, ld->src[i].ssa, remap, depth + 1, no_global_writes);
+      nir_intrinsic_instr *c = nir_instr_as_intrinsic(nir_instr_clone(b->shader, instr));
+      nir_builder_instr_insert(b, &c->instr);
+      for (unsigned i = 0; i < ns; i++)
+         nir_src_rewrite(&c->src[i], lsrcs[i]);
+      _mesa_hash_table_insert(remap, def, &c->def);
+      return &c->def;
+   }
+   if (instr->type != nir_instr_type_alu)
+      return def;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   nir_def *srcs[NIR_ALU_MAX_INPUTS];
+   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++)
+      srcs[i] = mdg_remat_expr(b, alu->src[i].src.ssa, remap, depth + 1, no_global_writes);
+   nir_alu_instr *c = nir_instr_as_alu(nir_instr_clone(b->shader, instr));
+   nir_builder_instr_insert(b, &c->instr);
+   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++)
+      nir_src_rewrite(&c->src[i].src, srcs[i]);
+   _mesa_hash_table_insert(remap, def, &c->def);
+   return &c->def;
+}
+
+/* Loads reorderable buffer data again at the start of each deeper-loop block
+ * that uses it, instead of keeping the value in registers across the loops.
+ * One load per block; phi uses keep the original. */
+static bool
+midgard_nir_remat_loop_loads(nir_shader *nir)
+{
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      struct util_dynarray loads;
+      util_dynarray_init(&loads, NULL);
+      const bool no_global_writes = mdg_no_global_writes(impl);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic &&
+                mdg_is_remat_load(nir_instr_as_intrinsic(instr), no_global_writes))
+               util_dynarray_append_typed(&loads, nir_intrinsic_instr *, nir_instr_as_intrinsic(instr));
+         }
+      }
+      bool impl_progress = false;
+      /* Per block: the rebuilt values (remaps) and the last instruction added. */
+      void *mem = ralloc_context(NULL);
+      struct hash_table *remaps = _mesa_pointer_hash_table_create(mem);
+      struct hash_table *remaps_end = _mesa_pointer_hash_table_create(mem);
+      util_dynarray_foreach(&loads, nir_intrinsic_instr *, l) {
+         nir_intrinsic_instr *load = *l;
+         const unsigned depth = mdg_loop_depth(load->instr.block);
+         nir_block *blocks[16];
+         nir_def *clones[16];
+         unsigned n = 0;
+         nir_foreach_use_safe(src, &load->def) {
+            if (nir_src_is_if(src))
+               continue;
+            nir_instr *user = nir_src_use_instr(src);
+            if (user->type == nir_instr_type_phi)
+               continue;
+            nir_block *block = user->block;
+            if (mdg_loop_depth(block) <= depth)
+               continue;
+            unsigned k;
+            for (k = 0; k < n && blocks[k] != block; k++)
+               ;
+            if (k == n) {
+               if (n == ARRAY_SIZE(blocks))
+                  continue;
+               struct hash_entry *he = _mesa_hash_table_search(remaps, block);
+               struct hash_table *remap = he ? he->data : _mesa_pointer_hash_table_create(remaps);
+               if (!he)
+                  _mesa_hash_table_insert(remaps, block, remap);
+               /* After what this block already rebuilt (its address
+                * expressions and earlier reloads), before its own code. */
+               nir_builder b = nir_builder_at(nir_after_phis(block));
+               struct hash_entry *last = _mesa_hash_table_search(remaps_end, block);
+               if (last)
+                  b.cursor = nir_after_instr(last->data);
+               const unsigned ns = nir_intrinsic_infos[load->intrinsic].num_srcs;
+               nir_def *srcs[4];
+               for (unsigned i = 0; i < ns; i++)
+                  srcs[i] = mdg_remat_expr(&b, load->src[i].ssa, remap, 0, no_global_writes);
+               nir_intrinsic_instr *c = nir_instr_as_intrinsic(nir_instr_clone(nir, &load->instr));
+               nir_builder_instr_insert(&b, &c->instr);
+               for (unsigned i = 0; i < ns; i++)
+                  nir_src_rewrite(&c->src[i], srcs[i]);
+               _mesa_hash_table_insert(remaps_end, block, &c->instr);
+               blocks[n] = block;
+               clones[n++] = &c->def;
+            }
+            nir_src_rewrite(src, clones[k]);
+            impl_progress = true;
+         }
+         if (nir_def_is_unused(&load->def))
+            nir_instr_remove(&load->instr);
+      }
+      ralloc_free(mem);
+      util_dynarray_fini(&loads);
+      progress |= nir_progress(impl_progress, impl, nir_metadata_control_flow);
+   }
+   return progress;
+}
+
 static void
-optimise_nir(nir_shader *nir, unsigned quirks, bool is_blend)
+optimise_nir(nir_shader *nir, unsigned quirks, bool is_blend, bool remat_loop_loads)
 {
    bool progress;
 
@@ -562,6 +753,9 @@ optimise_nir(nir_shader *nir, unsigned quirks, bool is_blend)
                                nir_move_load_input | nir_move_load_frag_coord |
                                nir_move_comparisons | nir_move_copies |
                                nir_move_load_ssbo;
+
+   if (remat_loop_loads)
+      NIR_PASS(_, nir, midgard_nir_remat_loop_loads);
 
    NIR_PASS(_, nir, nir_opt_sink, move_all);
    NIR_PASS(_, nir, nir_opt_move, move_all);
@@ -3094,7 +3288,7 @@ midgard_compile_shader_nir(nir_shader *nir,
    }
 
    /* Optimisation passes */
-   optimise_nir(nir, ctx->quirks, inputs->is_blend);
+   optimise_nir(nir, ctx->quirks, inputs->is_blend, inputs->midgard_remat_loop_loads);
 
    bool skip_internal = nir->info.internal;
    skip_internal &= !(midgard_debug & MIDGARD_DBG_INTERNAL);
