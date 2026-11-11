@@ -18,9 +18,31 @@ algebraic = [
    # Midgard scales fsin/fcos arguments by pi.
    (('fsin', a), ('fsin_mdg', ('fdiv', a, math.pi))),
    (('fcos', a), ('fcos_mdg', ('fdiv', a, math.pi))),
+
+   # Emitted as a move it would keep only the low word, zero-extended.
+   (('pack_64_2x32', a), ('ior', ('u2u64', 'a.x'), ('ishl', ('u2u64', 'a.y'), 32))),
+
+   # Midgard has no instructions for these (the driver's internal shaders use them).
+   (('pack_64_2x32_split', a, b), ('ior', ('u2u64', a), ('ishl', ('u2u64', b), 32))),
+   (('ffma', a, b, c), ('fadd', ('fmul', a, b), c)),
+   (('extract_u16', 'a@32', 0), ('iand', ('ushr', a, 0), 65535)),
+   (('insert_u16', 'a@32', 0), ('ishl', ('iand', a, 65535), 0)),
+   (('extract_u16', 'a@32', 1), ('iand', ('ushr', a, 16), 65535)),
+   (('insert_u16', 'a@32', 1), ('ishl', ('iand', a, 65535), 16)),
+   (('extract_u8', 'a@32', 0), ('iand', ('ushr', a, 0), 255)),
+   (('insert_u8', 'a@32', 0), ('ishl', ('iand', a, 255), 0)),
+   (('extract_u8', 'a@32', 1), ('iand', ('ushr', a, 8), 255)),
+   (('insert_u8', 'a@32', 1), ('ishl', ('iand', a, 255), 8)),
+   (('extract_u8', 'a@32', 2), ('iand', ('ushr', a, 16), 255)),
+   (('insert_u8', 'a@32', 2), ('ishl', ('iand', a, 255), 16)),
+   (('extract_u8', 'a@32', 3), ('iand', ('ushr', a, 24), 255)),
+   (('insert_u8', 'a@32', 3), ('ishl', ('iand', a, 255), 24)),
 ]
 
 algebraic_late = [
+    # After the general passes, which would fold this back into b2i64.
+    (('b2i64', a), ('u2u64', ('b2i32', a))),
+
     # Likewise we want fsub lowered but not isub
     (('fsub', a, b), ('fadd', a, ('fneg', b))),
 

@@ -343,6 +343,8 @@ mem_access_size_align_cb(nir_intrinsic_op intrin, uint8_t bytes,
       bit_size = 8;
    else if ((bytes & 2) || (align == 2))
       bit_size = 16;
+   else if (bit_size == 64 && !(bytes & 7) && align >= 8)
+      bit_size = 64;
    else if (bit_size >= 32)
       bit_size = 32;
 
@@ -360,6 +362,24 @@ static uint8_t
 lower_vec816_alu(const nir_instr *instr, const void *cb_data)
 {
    return 4;
+}
+
+/* A shared cmpxchg has no room for its offset (emit_atomic: the compare value
+ * takes the index slot), so it becomes a global one at the shared base plus
+ * the offset (CTS glsl.atomic_operations.comp_swap_*_compute_shared). */
+static bool
+midgard_lower_shared_cmpxchg(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_shared_atomic_swap)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *offset = nir_iadd_imm(b, intr->src[0].ssa, nir_intrinsic_base(intr));
+   nir_def *addr = nir_iadd(b, nir_load_shared_base_ptr(b, 1, 64), nir_u2u64(b, offset));
+   nir_def *res = nir_global_atomic_swap(b, intr->def.bit_size, addr, intr->src[1].ssa,
+                                         intr->src[2].ssa,
+                                         .atomic_op = nir_intrinsic_atomic_op(intr));
+   nir_def_replace(&intr->def, res);
+   return true;
 }
 
 void
@@ -418,6 +438,14 @@ midgard_postprocess_nir(nir_shader *nir, unsigned arch)
 
    NIR_PASS(_, nir, nir_lower_frexp);
    NIR_PASS(_, nir, midgard_nir_lower_global_load);
+
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, midgard_lower_shared_cmpxchg,
+            nir_metadata_control_flow, NULL);
+
+   /* No 64-bit division or 2x32->64 multiply in the ISA (PMVK's indirect
+    * draw patch shader has both: "Unhandled ALU op umul_2x32_64"). Before
+    * the 32-bit division lowering, which the 64-bit one may emit. */
+   NIR_PASS(_, nir, nir_lower_int64);
 
    nir_lower_idiv_options idiv_options = {
       .allow_fp16 = true,
@@ -1280,6 +1308,7 @@ emit_atomic(compiler_context *ctx, nir_intrinsic_instr *instr)
 
          ins.src[1] = nir_src_index(ctx, src_offset);
          ins.src_types[1] = nir_type_uint64;
+         ins.load_store.bitsize_toggle = true; /* 64-bit address, as mir_set_offset */
       }
    } else
       mir_set_offset(ctx, &ins, src_offset,
@@ -1410,12 +1439,17 @@ emit_image_op(compiler_context *ctx, nir_intrinsic_instr *instr)
 
 static void
 emit_attr_read(compiler_context *ctx, unsigned dest, unsigned offset,
-               unsigned nr_comp, nir_alu_type t)
+               unsigned nr_comp, unsigned component, nir_alu_type t)
 {
    midgard_instruction ins = m_ld_attr_32(dest, PACK_LDST_ATTRIB_OFS(offset));
    ins.load_store.arg_reg = REGISTER_LDST_ZERO;
    ins.load_store.index_reg = REGISTER_LDST_ZERO;
    ins.mask = mask_of(nr_comp);
+
+   /* An input that starts at a later component of its location (Vulkan's
+    * component qualifier) reads from there, as emit_varying_read does. */
+   for (unsigned i = 0; i < ARRAY_SIZE(ins.swizzle[0]); ++i)
+      ins.swizzle[0][i] = MIN2(i + component, COMPONENT_W);
 
    /* Use the type appropriate load */
    switch (t) {
@@ -1507,6 +1541,22 @@ emit_fragment_store(compiler_context *ctx, unsigned src, unsigned src_z,
    br->branch.target_block = ctx->block_count - 1;
 }
 
+/* The workgroup's shared memory address: LOCAL_STORAGE_PTR.zw, the 64-bit
+ * base LDST_SHARED accesses add their offset to. */
+static void
+emit_shared_base_ptr(compiler_context *ctx, nir_intrinsic_instr *instr)
+{
+   unsigned reg = nir_def_index(&instr->def);
+   midgard_instruction ins = m_ldst_mov(reg, 0);
+   ins.mask = mask_of(2);
+   ins.swizzle[0][0] = COMPONENT_Z;
+   ins.swizzle[0][1] = COMPONENT_W;
+   ins.swizzle[0][2] = COMPONENT_Z;
+   ins.swizzle[0][3] = COMPONENT_W;
+   ins.load_store.arg_reg = REGISTER_LDST_LOCAL_STORAGE_PTR;
+   emit_mir_instruction(ctx, &ins);
+}
+
 static void
 emit_compute_builtin(compiler_context *ctx, nir_intrinsic_instr *instr)
 {
@@ -1535,7 +1585,7 @@ static void
 emit_vertex_builtin(compiler_context *ctx, nir_intrinsic_instr *instr)
 {
    unsigned reg = nir_def_index(&instr->def);
-   emit_attr_read(ctx, reg, vertex_builtin_arg(instr->intrinsic), 1,
+   emit_attr_read(ctx, reg, vertex_builtin_arg(instr->intrinsic), 1, 0,
                   nir_type_int);
 }
 
@@ -1698,7 +1748,7 @@ emit_intrinsic(compiler_context *ctx, nir_intrinsic_instr *instr)
          emit_varying_read(ctx, reg, offset, nr_comp, component,
                            indirect_offset, t | instr->def.bit_size, is_flat);
       } else if (ctx->stage == MESA_SHADER_VERTEX) {
-         emit_attr_read(ctx, reg, offset, nr_comp, t);
+         emit_attr_read(ctx, reg, offset, nr_comp, component, t);
       } else {
          UNREACHABLE("Unknown load");
       }
@@ -1952,6 +2002,10 @@ emit_intrinsic(compiler_context *ctx, nir_intrinsic_instr *instr)
       emit_compute_builtin(ctx, instr);
       break;
 
+   case nir_intrinsic_load_shared_base_ptr:
+      emit_shared_base_ptr(ctx, instr);
+      break;
+
    case nir_intrinsic_load_raw_vertex_id:
       ctx->info->midgard.vs.reads_raw_vertex_id = true;
       FALLTHROUGH;
@@ -2016,6 +2070,8 @@ midgard_tex_format(enum glsl_sampler_dim dim)
    case GLSL_SAMPLER_DIM_MS:
    case GLSL_SAMPLER_DIM_EXTERNAL:
    case GLSL_SAMPLER_DIM_RECT:
+   case GLSL_SAMPLER_DIM_SUBPASS:
+   case GLSL_SAMPLER_DIM_SUBPASS_MS:
       return 2;
 
    case GLSL_SAMPLER_DIM_3D:

@@ -1199,7 +1199,18 @@ mir_schedule_alu(compiler_context *ctx, midgard_instruction **instructions,
     * this will be in sadd, we boost this to prevent scheduling csel into
     * smul */
 
-   if (writeout && (branch->constants.u32[0] || ctx->inputs->is_blend)) {
+   /* r1.z selects the render target and sample of a writeout. For RT 0,
+    * sample 0 (constant 0) the move was left out on the assumption that r1.z
+    * is still 0, but register allocation may use r1 before the writeout: a
+    * shader writing four targets at 4x sent RT 0 elsewhere (CTS
+    * image.general_layout.msaa.different, renderpasses ... multisample). */
+   bool multi_writeout = false;
+   for (unsigned rt = 0; rt < ARRAY_SIZE(ctx->writeout_branch); ++rt) {
+      for (unsigned smp = 0; smp < MIDGARD_MAX_SAMPLE_ITER; ++smp)
+         multi_writeout |= (rt || smp) && ctx->writeout_branch[rt][smp];
+   }
+
+   if (writeout && (branch->constants.u32[0] || ctx->inputs->is_blend || multi_writeout)) {
       sadd = ralloc(ctx, midgard_instruction);
       *sadd = v_mov(~0, make_compiler_temp(ctx));
       sadd->unit = UNIT_SADD;

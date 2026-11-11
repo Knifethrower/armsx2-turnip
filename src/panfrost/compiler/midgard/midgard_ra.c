@@ -675,13 +675,13 @@ mir_compute_interference(compiler_context *ctx, struct lcra_state *l)
          }
 
          /* Add blend shader interference: blend shaders might
-          * clobber r0-r3. */
+          * clobber r0-r7 (max_work_registers allows them 8). */
          if (ins->compact_branch && ins->writeout) {
             for (unsigned i = 0; i < ctx->temp_count; ++i) {
                if (!live[i])
                   continue;
 
-               for (unsigned j = 0; j < 4; j++) {
+               for (unsigned j = 0; j < 8; j++) {
                   lcra_add_node_interference(l, ctx->temp_count + j, 0xFFFF, i,
                                              live[i]);
                }
@@ -789,7 +789,7 @@ allocate_registers(compiler_context *ctx, bool *spilled)
    /* Initialize LCRA. Allocate extra node at the end for r1-r3 for
     * interference */
 
-   struct lcra_state *l = lcra_alloc_equations(ctx->temp_count + 4, 5);
+   struct lcra_state *l = lcra_alloc_equations(ctx->temp_count + 8, 5);
    unsigned node_r1 = ctx->temp_count + 1;
 
    /* Starts of classes, in bytes */
@@ -843,6 +843,18 @@ allocate_registers(compiler_context *ctx, bool *spilled)
             if (s < ctx->temp_count)
                min_alignment[s] = MAX2((size == 64) ? 3 : 2, min_alignment[s]);
          }
+      }
+
+      /* An image op's coordinate is four 16-bit lanes from its start
+       * component when bitsize_toggle is set (3D, arrays, cubes), two
+       * otherwise, and the start is counted in 32-bit components: unaligned,
+       * a 3D load read its y and z from the wrong lanes (CTS
+       * image.qualifiers.*.3d). */
+      if (ins->type == TAG_LOAD_STORE_4 && OP_IS_IMAGE(ins->op)) {
+         unsigned s = ins->src[1];
+         if (s < ctx->temp_count)
+            min_alignment[s] =
+               MAX2(ins->load_store.bitsize_toggle ? 3 : 2, min_alignment[s]);
       }
 
       /* Anything read as 16-bit needs proper alignment to ensure the
@@ -991,7 +1003,7 @@ allocate_registers(compiler_context *ctx, bool *spilled)
     * the following segment. We model this as interference.
     */
 
-   for (unsigned i = 0; i < 4; ++i)
+   for (unsigned i = 0; i < 8; ++i)
       l->solutions[ctx->temp_count + i] = (16 * i);
 
    mir_foreach_block(ctx, _blk) {

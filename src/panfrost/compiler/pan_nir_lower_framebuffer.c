@@ -241,7 +241,11 @@ pan_pack_unorm_1010102(nir_builder *b, nir_def *v)
       nir_f2u32(b, nir_fround_even(b, nir_fmul(b, nir_fsat(b, v), scale)));
 
    nir_def *top8 = nir_ushr(b, s, nir_imm_ivec4(b, 0x2, 0x2, 0x2, 0x2));
-   nir_def *top8_rgb = nir_pack_32_4x8(b, nir_u2u8(b, top8));
+   /* Not pack_32_4x8: Midgard got the vec4 of bytes wrong (every byte red). */
+   nir_def *top8_rgb =
+      nir_ior(b, nir_channel(b, top8, 0),
+              nir_ior(b, nir_ishl_imm(b, nir_channel(b, top8, 1), 8),
+                      nir_ishl_imm(b, nir_channel(b, top8, 2), 16)));
 
    nir_def *bottom2 = nir_iand(b, s, nir_imm_ivec4(b, 0x3, 0x3, 0x3, 0x3));
 
@@ -422,7 +426,9 @@ static nir_def *pan_pack(nir_builder *b,
          nir_def *clamped = pan_fsat(b, unpacked, snorm);
          nir_def *normed = nir_fmul_imm(b, clamped, multiplier);
 
-         raw = nir_f2uN(b, normed, d.size);
+         /* Round to nearest, as Vulkan and GL want and the packs below do:
+          * f2u truncates. */
+         raw = nir_f2uN(b, nir_fround_even(b, normed), d.size);
       }
 
       /* Pack the raw format */
@@ -444,6 +450,7 @@ static nir_def *pan_pack(nir_builder *b,
    case PIPE_FORMAT_A4R4_UNORM:
    case PIPE_FORMAT_R4A4_UNORM:
    case PIPE_FORMAT_A4B4G4R4_UNORM:
+   case PIPE_FORMAT_A4R4G4B4_UNORM:
    case PIPE_FORMAT_R4G4B4A4_UNORM:
       return pan_pack_unorm(b, unpacked, 4, 4, 4, 4);
    case PIPE_FORMAT_B5G5R5A1_UNORM:
