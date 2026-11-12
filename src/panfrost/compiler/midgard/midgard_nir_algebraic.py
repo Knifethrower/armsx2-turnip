@@ -22,6 +22,12 @@ algebraic = [
    # Emitted as a move it would keep only the low word, zero-extended.
    (('pack_64_2x32', a), ('ior', ('u2u64', 'a.x'), ('ishl', ('u2u64', 'a.y'), 32))),
 
+   # The other way, the move shrinks each 64-bit lane to its low word, so .y
+   # got the low word again (a pointer turned into a uvec2 lost its top half).
+   (('unpack_64_2x32', a), ('vec2', ('u2u32', a), ('u2u32', ('ushr', a, 32)))),
+   (('unpack_64_2x32_split_x', a), ('u2u32', a)),
+   (('unpack_64_2x32_split_y', a), ('u2u32', ('ushr', a, 32))),
+
    # Midgard has no instructions for these (the driver's internal shaders use them).
    (('pack_64_2x32_split', a, b), ('ior', ('u2u64', a), ('ishl', ('u2u64', b), 32))),
    (('ffma', a, b, c), ('fadd', ('fmul', a, b), c)),
